@@ -1,8 +1,13 @@
-[submodule "docs"]
+[submodule "Docs"]
 	path = docs
 	url = https://github.com/TLSenz/Homelab_Documentation.git
 	branch = main
-[submodule "terraform"]
+[submodule "Terraform"]
 	path = terraform
 	url = https://github.com/TLSenz/Homelab_Declerative.git
-	branch = main
+        branch = main
+
+[submodule "Inventar_Application"]
+        path = Inventar
+        url = https://github.com/TLSenz/HomeLab_inventar_lambda.git
+        branch = main
