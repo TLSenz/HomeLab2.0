@@ -1,19 +1,37 @@
-name: Deploy Services
+name: Multi-Host NixOS Deploy
 
 on:
-  push:
-    branches: [ main ]
+  repository_dispatch:
+    types: [deploy-fleet]
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-latest
-
+    outputs:
+      targets: ${{ steps.set-targets.outputs.matrix }}
     steps:
-    - name: Connects to Tailscale
-    - uses: tailscale/github-action@v4
-      with:
-        oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-        oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-        tags: tag:ci
+      - id: set-targets
+        run: |
+          echo "matrix=$(echo '${{ github.event.client_payload.machines }}' | jq -c .)" >> $GITHUB_OUTPUT
 
+  deploy:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false 
+      matrix: 
+        include: ${{ fromJson(needs.prepare.outputs.targets) }}
     
+    steps:
+      - uses: actions/checkout@v4
+      - uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Deploy to ${{ matrix.host }}
+        run: |
+          # Accessing specific data for THIS specific matrix instance
+          nixos-rebuild ${{ matrix.mode }} \
+            --flake .#${{ matrix.configuration }} \
+            --target-host ${{ matrix.host }} \
+            --use-remote-sudo
