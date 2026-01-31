@@ -1,0 +1,216 @@
+name: Terraform Infrastructure Sync
+
+on:
+  repository_dispatch:
+    types: [terraform-changed]
+  workflow_dispatch:
+    inputs:
+      terraform_repo:
+        description: 'Terraform repository that triggered this sync'
+        required: false
+        default: ''
+      affected_resources:
+        description: 'Resources that changed (JSON array)'
+        required: false
+        default: '[]'
+
+jobs:
+  analyze-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      needs_deployment: ${{ steps.analyze.outputs.needs_deployment }}
+      affected_machines: ${{ steps.analyze.outputs.affected_machines }}
+      deployment_plan: ${{ steps.analyze.outputs.deployment_plan }}
+    
+    steps:
+      - name: Analyze Terraform Changes
+        id: analyze
+        run: |
+          # Parse webhook payload or workflow inputs
+          if [ "${{ github.event.client_payload }}" != "" ]; then
+            # Triggered from webhook
+            CHANGED_RESOURCES='${{ github.event.client_payload.resources || github.event.client_payload.affected_resources || "[]" }}'
+            TERRAFORM_REPO='${{ github.event.client_payload.repo || "unknown" }}'
+          else
+            # Triggered manually
+            CHANGED_RESOURCES='${{ github.event.inputs.affected_resources }}'
+            TERRAFORM_REPO='${{ github.event.inputs.terraform_repo }}'
+          fi
+          
+          echo "Terraform repository: $TERRAFORM_REPO"
+          echo "Changed resources: $CHANGED_RESOURCES"
+          
+          # Determine if infrastructure changes require NixOS updates
+          # Common patterns that typically require NixOS reconfiguration
+          NEEDS_DEPLOYMENT="false"
+          AFFECTED_MACHINES="[]"
+          
+          # Check for resource types that commonly affect NixOS configurations
+          if echo "$CHANGED_RESOURCES" | grep -q -E "(instance|server|vm|network|security_group|firewall)"; then
+            NEEDS_DEPLOYMENT="true"
+            
+            # Extract machine information from changed resources
+            # This is a simplified example - you'd adjust based on your actual resource naming
+            AFFECTED_MACHINES=$(echo "$CHANGED_RESOURCES" | jq -r '
+              map(select(.type | test("instance|server|vm"))) |
+              map({
+                host: .attributes.public_ip // .attributes.private_ip // "unknown",
+                config: .attributes.name // .id // "unknown",
+                role: .attributes.role // .tags.role // "web-server",
+                mode: "switch"
+              })'
+            )
+          fi
+          
+          echo "needs_deployment=$NEEDS_DEPLOYMENT" >> $GITHUB_OUTPUT
+          echo "affected_machines=$AFFECTED_MACHINES" >> $GITHUB_OUTPUT
+          
+          # Create deployment plan
+          DEPLOYMENT_PLAN=$(jq -n \
+            --argjson machines "$AFFECTED_MACHINES" \
+            --arg repo "$TERRAFORM_REPO" \
+            --argjson needs_deploy "$NEEDS_DEPLOYMENT" \
+            '{
+              terraform_repo: $repo,
+              requires_nixos_update: $needs_deploy,
+              machines: $machines,
+              timestamp: now
+            }'
+          )
+          echo "deployment_plan=$DEPLOYMENT_PLAN" >> $GITHUB_OUTPUT
+
+  trigger-backup:
+    needs: analyze-changes
+    if: needs.analyze-changes.outputs.needs_deployment == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Trigger Backup Workflow
+        run: |
+          echo "Triggering backup before infrastructure update..."
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{
+              "event_type": "pre-deployment-backup",
+              "client_payload": {
+                "triggered_by": "terraform-sync",
+                "terraform_repo": "${{ needs.analyze-changes.outputs.deployment_plan | fromJSON | .terraform_repo }}",
+                "reason": "pre-deployment backup before Terraform changes"
+              }
+            }'
+
+  deploy-nixos-changes:
+    needs: [analyze-changes, trigger-backup]
+    if: needs.analyze-changes.outputs.needs_deployment == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            trusted-users = runner
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          args: --tags=tag:ci
+
+      - name: Deploy NixOS Configuration Changes
+        run: |
+          # Parse the affected machines from the analysis step
+          MACHINES='${{ needs.analyze-changes.outputs.affected_machines }}'
+          PLAN='${{ needs.analyze-changes.outputs.deployment_plan }}'
+          
+          echo "Deployment plan: $PLAN"
+          echo "Machines to update: $MACHINES"
+          
+          # Deploy to each affected machine
+          echo "$MACHINES" | jq -c '.[]' | while read -r machine; do
+            HOST=$(echo "$machine" | jq -r '.host')
+            CONFIG=$(echo "$machine" | jq -r '.config')
+            ROLE=$(echo "$machine" | jq -r '.role')
+            MODE=$(echo "$machine" | jq -r '.mode')
+            
+            echo "Deploying to $HOST with config: $CONFIG, role: $ROLE"
+            
+            # Generate deployment config for this machine
+            if [ "$ROLE" != "null" ] && [ "$ROLE" != "" ]; then
+              echo '{"role": "'$ROLE'", "services": []}' > deployment-config.json
+            else
+              echo '{"role": null, "services": []}' > deployment-config.json
+            fi
+            
+            # Run the deployment
+            nixos-rebuild $MODE \
+              --flake .#$CONFIG \
+              --target-host $HOST \
+              --build-host $HOST \
+              --impure \
+              --use-remote-sudo
+              
+            echo "Deployment completed for $HOST"
+          done
+
+  update-status:
+    needs: [analyze-changes, trigger-backup, deploy-nixos-changes]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Report Status
+        run: |
+          echo "=== Terraform Sync Status ==="
+          echo "Repository: ${{ github.repository }}"
+          echo "Trigger: ${{ github.event_name }}"
+          
+          if [ "${{ needs.analyze-changes.outputs.needs_deployment }}" == "true" ]; then
+            echo "Status: Infrastructure changes detected and processed"
+            echo "Affected machines: ${{ needs.analyze-changes.outputs.affected_machines }}"
+            echo "Backup triggered: ${{ needs.trigger-backup.result }}"
+            echo "NixOS deployment: ${{ needs.deploy-nixos-changes.result }}"
+          else
+            echo "Status: No NixOS deployment required"
+          fi
+          
+          echo "==========================="
+
+  notify-monitoring:
+    needs: [analyze-changes, deploy-nixos-changes]
+    if: needs.analyze-changes.outputs.needs_deployment == 'true' && needs.deploy-nixos-changes.result == 'success'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Update Infrastructure Status
+        run: |
+          # This could integrate with your monitoring system
+          echo "Infrastructure updated successfully"
+          echo "Updated by Terraform sync workflow"
+          
+          # Example: Update a status file or send notification
+          # Adjust based on your monitoring/notification setup
+          
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          STATUS=$(cat << EOF
+          {
+            "timestamp": "$TIMESTAMP",
+            "event": "terraform_sync_completed",
+            "repository": "${{ github.repository }}",
+            "workflow_run": "${{ github.run_id }}",
+            "affected_resources": ${{ needs.analyze-changes.outputs.affected_machines }}
+          }
+          EOF
+          )
+          
+          echo "Status update: $STATUS"

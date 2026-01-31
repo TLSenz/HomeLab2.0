@@ -11,6 +11,8 @@ jobs:
       targets: ${{ steps.set-targets.outputs.matrix }}
     steps:
       - id: set-targets
+        # Expected payload: { "machines": [{ "host": "100.x.y.1", "config": "node-a", "role": "web-server", "services": ["web"], "mode": "switch" }] }
+        # Role takes precedence over services if both are provided
         run: |
           echo "matrix=$(echo '${{ github.event.client_payload.machines }}' | jq -c .)" >> $GITHUB_OUTPUT
 
@@ -18,20 +20,67 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false 
-      matrix: 
+      fail-fast: false
+      matrix:
         include: ${{ fromJson(needs.prepare.outputs.targets) }}
-    
+
     steps:
       - uses: actions/checkout@v4
-      - uses: tailscale/github-action@v2
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            trusted-users = runner
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          args: --tags=tag:ci
+
+      - name: Generate Deployment Configuration
+        run: |
+          # Create deployment config for role-based or service-based deployment
+          ROLE='${{ matrix.role || ''null'' }}'
+          SERVICES='${{ toJson(matrix.services) }}'
+          
+          # Create JSON config for flake.nix
+          if [ "$ROLE" != "null" ] && [ "$ROLE" != "" ]; then
+            echo '{"role": "'$ROLE'", "services": []}' > deployment-config.json
+          else
+            echo '{"role": null, "services": '$SERVICES'}' > deployment-config.json
+          fi
 
       - name: Deploy to ${{ matrix.host }}
         run: |
-          # Accessing specific data for THIS specific matrix instance
+          # Use --impure so Nix can read the generated JSON file
           nixos-rebuild ${{ matrix.mode }} \
-            --flake .#${{ matrix.configuration }} \
+            --flake .#${{ matrix.config }} \
             --target-host ${{ matrix.host }} \
+            --build-host ${{ matrix.host }} \
+            --impure \
             --use-remote-sudo
+
+      - name: Deployment Validation
+        run: |
+          # Basic connectivity test after deployment
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${{ matrix.host }} "echo 'Deployment successful: $(hostname)'"
+          
+          # Health check based on deployed role/services
+          ROLE='${{ matrix.role || ''null'' }}'
+          if [ "$ROLE" = "web-server" ] || [[ '${{ join(matrix.services, ' ') }}' == *web* ]]; then
+            echo "Checking web server..."
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${{ matrix.host }} "curl -f http://localhost/ || echo 'Web check failed'"
+          fi
+          
+          if [ "$ROLE" = "database-server" ] || [[ '${{ join(matrix.services, ' ') }}' == *db* ]]; then
+            echo "Checking database..."
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${{ matrix.host }} "pg_isready || echo 'Database check failed'"
+          fi

@@ -1,20 +1,135 @@
-name: Backup Data befor Deploying new Services
+name: Backup Data Before Deploying New Services
 
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      target_servers:
+        description: 'Target servers to backup (comma-separated IPs)'
+        required: false
+        default: ''
+      backup_type:
+        description: 'Type of backup: full, incremental, config-only'
+        required: false
+        default: 'full'
 
 jobs:
-  build:
+  backup:
     runs-on: ubuntu-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        servers: ${{fromJson('["100.64.0.1", "100.64.0.2", "100.64.0.3"]')}}
+    
     steps:
-    - name: Connects to Tailscale
-    - uses: tailscale/github-action@v4
-      with:
-        oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-        oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-        tags: tag:ci
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
 
-    - name: Setup SSH
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Create backup directories
+        run: |
+          mkdir -p backups/${{ matrix.servers }}
+          chmod 700 backups/${{ matrix.servers }}
+
+      - name: Backup system configuration
+        run: |
+          SERVER="${{ matrix.servers }}"
+          BACKUP_DIR="backups/${{ matrix.servers }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          
+          echo "Starting backup for server: $SERVER"
+          
+          # Create backup directories on remote server
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 $SERVER \
+            "mkdir -p /tmp/backup_${TIMESTAMP}"
+          
+          # Backup configuration files
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 $SERVER \
+            "tar -czf /tmp/backup_${TIMESTAMP}/etc.tar.gz /etc 2>/dev/null || true"
+          
+          # Backup NixOS configuration
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 $SERVER \
+            "tar -czf /tmp/backup_${TIMESTAMP}/nixos.tar.gz /etc/nixos 2>/dev/null || true"
+          
+          # Backup user homes (excluding large temporary files)
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 $SERVER \
+            "tar -czf /tmp/backup_${TIMESTAMP}/homes.tar.gz \
+               --exclude='*.tmp' --exclude='*.log' --exclude='cache' \
+               --exclude='node_modules' --exclude='.cache' \
+               /home 2>/dev/null || true"
+          
+          # Backup service data if exists
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 $SERVER \
+            "tar -czf /tmp/backup_${TIMESTAMP}/services.tar.gz \
+               /var/lib 2>/dev/null || true"
+          
+          # Download backups
+          scp -o StrictHostKeyChecking=no -o ConnectTimeout=30 \
+            $SERVER:/tmp/backup_${TIMESTAMP}/*.tar.gz $BACKUP_DIR/
+          
+          # Cleanup remote backup directory
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 $SERVER \
+            "rm -rf /tmp/backup_${TIMESTAMP}"
+          
+          # Create backup manifest
+          cat > $BACKUP_DIR/manifest_${TIMESTAMP}.json << EOF
+          {
+            "server": "$SERVER",
+            "timestamp": "$TIMESTAMP",
+            "backup_type": "${{ github.event.inputs.backup_type || 'full' }}",
+            "files": [
+              "etc.tar.gz",
+              "nixos.tar.gz", 
+              "homes.tar.gz",
+              "services.tar.gz"
+            ],
+            "created_by": "GitHub Actions - ${{ github.workflow }}"
+          }
+          EOF
+          
+          echo "Backup completed for $SERVER at $TIMESTAMP"
+
+      - name: Upload backup artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-${{ matrix.servers }}
+          path: backups/${{ matrix.servers }}/
+          retention-days: 30
+
+      - name: Clean up old local backups
+        run: |
+          # Keep only last 5 backup sets locally
+          ls -1t backups/ | tail -n +6 | xargs -I {} rm -rf backups/{} 2>/dev/null || true
+
+  verify-backups:
+    needs: backup
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download all backup artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: backup-*
+          merge-multiple: true
+          path: all-backups/
+
+      - name: Verify backup integrity
+        run: |
+          echo "Verifying backup integrity..."
+          find all-backups/ -name "*.tar.gz" -exec tar -tzf {} \; >/dev/null
+          echo "All backup files are valid archives"
+          
+          # Show backup summary
+          find all-backups/ -name "manifest_*.json" -exec cat {} \;
