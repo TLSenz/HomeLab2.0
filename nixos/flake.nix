@@ -18,7 +18,7 @@
 
       # 2. Define your library of available roles
       roleLibrary = {
-        web-server      = ./roles/web-server.ni;
+        web-server      = ./roles/web-server.nix;
         database-server  = ./roles/database-server.nix;
         full-stack       = ./roles/full-stack.nix;
         storage-server   = ./roles/storage-server.nix;
