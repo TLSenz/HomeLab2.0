@@ -11,11 +11,14 @@
       serviceLibrary = {
         web      = ./modules/services/webserver.nix;
         db       = ./modules/services/database.nix;
+        immich   = ./modules/immich.nix;
+        nextcloud = ./modules/gitlab.nix;
+        vaultwarden = ./modules/vaultwarden.nix;
       };
 
       # 2. Define your library of available roles
       roleLibrary = {
-        web-server      = ./roles/web-server.nix;
+        web-server      = ./roles/web-server.ni;
         database-server  = ./roles/database-server.nix;
         full-stack       = ./roles/full-stack.nix;
         storage-server   = ./roles/storage-server.nix;
