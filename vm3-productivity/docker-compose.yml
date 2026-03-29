@@ -1,0 +1,223 @@
+# =============================================================================
+# VM3 - Productivity Stack
+# Host IP: 192.168.1.73
+# =============================================================================
+# Run: docker compose up -d
+# Mailcow runs separately - see README.md
+
+services:
+  # =========================================================================
+  # NEXTCLOUD - Database
+  # =========================================================================
+  nextcloud-db:
+    container_name: nextcloud-db
+    image: mariadb:11
+    restart: unless-stopped
+    command: --transaction-isolation=READ-COMMITTED --log-bin=binlog --binlog-format=ROW
+    environment:
+      TZ: ${TZ}
+      MYSQL_ROOT_PASSWORD: ${NEXTCLOUD_MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: ${NEXTCLOUD_MYSQL_PASSWORD}
+    volumes:
+      - ./nextcloud/db:/var/lib/mysql
+    networks:
+      - nextcloud-internal
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =========================================================================
+  # NEXTCLOUD - Cache
+  # =========================================================================
+  nextcloud-redis:
+    container_name: nextcloud-redis
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --requirepass ${NEXTCLOUD_REDIS_PASSWORD}
+    volumes:
+      - ./nextcloud/redis:/data
+    networks:
+      - nextcloud-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${NEXTCLOUD_REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =========================================================================
+  # NEXTCLOUD
+  # =========================================================================
+  nextcloud:
+    container_name: nextcloud
+    image: nextcloud:latest
+    restart: unless-stopped
+    hostname: nextcloud
+    ports:
+      - "8080:80"
+    environment:
+      TZ: ${TZ}
+      MYSQL_HOST: nextcloud-db
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: ${NEXTCLOUD_MYSQL_PASSWORD}
+      REDIS_HOST: nextcloud-redis
+      REDIS_HOST_PASSWORD: ${NEXTCLOUD_REDIS_PASSWORD}
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD}
+      NEXTCLOUD_TRUSTED_DOMAINS: cloud.${DOMAIN}
+      OVERWRITEPROTOCOL: https
+      TRUSTED_PROXIES: 0.0.0.0/0
+    volumes:
+      - ./nextcloud/html:/var/www/html
+      - /mnt/nas/nextcloud:/var/www/html/data
+    networks:
+      - nextcloud-internal
+    depends_on:
+      nextcloud-db:
+        condition: service_healthy
+      nextcloud-redis:
+        condition: service_healthy
+
+  # =========================================================================
+  # WIKI.JS - Database
+  # =========================================================================
+  wikijs-db:
+    container_name: wikijs-db
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wikijs
+      POSTGRES_USER: wikijs
+      POSTGRES_PASSWORD: ${WIKIJS_POSTGRES_PASSWORD}
+    volumes:
+      - ./wikijs/db:/var/lib/postgresql/data
+    networks:
+      - wikijs-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wikijs"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =========================================================================
+  # WIKI.JS
+  # =========================================================================
+  wikijs:
+    container_name: wikijs
+    image: ghcr.io/requarks/wiki:2
+    restart: unless-stopped
+    hostname: wikijs
+    ports:
+      - "3100:3000"
+    environment:
+      TZ: ${TZ}
+      DB_TYPE: postgres
+      DB_HOST: wikijs-db
+      DB_PORT: "5432"
+      DB_USER: wikijs
+      DB_PASS: ${WIKIJS_POSTGRES_PASSWORD}
+      DB_NAME: wikijs
+    volumes:
+      - ./wikijs/data:/wiki/data
+    networks:
+      - wikijs-internal
+    depends_on:
+      wikijs-db:
+        condition: service_healthy
+
+  # =========================================================================
+  # LINKDING - Database
+  # =========================================================================
+  linkding-db:
+    container_name: linkding-db
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: linkding
+      POSTGRES_USER: linkding
+      POSTGRES_PASSWORD: ${LINKDING_POSTGRES_PASSWORD}
+    volumes:
+      - ./linkding/db:/var/lib/postgresql/data
+    networks:
+      - linkding-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U linkding"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =========================================================================
+  # LINKDING - Bookmarks
+  # =========================================================================
+  linkding:
+    container_name: linkding
+    image: sissbruecker/linkding:latest
+    restart: unless-stopped
+    hostname: linkding
+    ports:
+      - "9090:9090"
+    environment:
+      TZ: ${TZ}
+      LD_DB_ENGINE: postgres
+      LD_DB_HOST: linkding-db
+      LD_DB_PORT: "5432"
+      LD_DB_DATABASE: linkding
+      LD_DB_USER: linkding
+      LD_DB_PASSWORD: ${LINKDING_POSTGRES_PASSWORD}
+    volumes:
+      - ./linkding/data:/etc/linkding/data
+    networks:
+      - linkding-internal
+    depends_on:
+      linkding-db:
+        condition: service_healthy
+
+  # =========================================================================
+  # NODE EXPORTER (Host Metrics)
+  # =========================================================================
+  node-exporter:
+    container_name: node-exporter
+    image: prom/node-exporter:latest
+    restart: unless-stopped
+    command:
+      - '--path.rootfs=/host'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    ports:
+      - "9100:9100"
+
+  # =========================================================================
+  # CADVISOR (Container Metrics)
+  # =========================================================================
+  cadvisor:
+    container_name: cadvisor
+    image: gcr.io/cadvisor/cadvisor:latest
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "8081:8080"
+
+networks:
+  nextcloud-internal:
+    name: nextcloud-internal
+    driver: bridge
+  wikijs-internal:
+    name: wikijs-internal
+    driver: bridge
+  linkding-internal:
+    name: linkding-internal
+    driver: bridge
